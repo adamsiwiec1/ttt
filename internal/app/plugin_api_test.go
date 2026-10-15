@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/eugenioenko/ttt/internal/config"
+	"github.com/eugenioenko/ttt/internal/plugin"
 	"github.com/eugenioenko/ttt/internal/term"
 	"github.com/eugenioenko/ttt/internal/ui"
 	"github.com/eugenioenko/ttt/internal/widgets"
@@ -436,5 +438,78 @@ func TestPluginFilesystemAPI_SymlinkedRoot(t *testing.T) {
 	}
 	if err := fs.WriteFile(filepath.Join(link, "escape", "x.txt"), "x"); err == nil {
 		t.Error("a symlink inside the root that points outside it was allowed")
+	}
+}
+
+func TestPluginFilesystemAPIFor_ScopedPaths(t *testing.T) {
+	base := t.TempDir()
+	home := filepath.Join(base, "home")
+	cfg := filepath.Join(base, "cfg")
+	workspace := filepath.Join(base, "ws")
+	pluginDir := filepath.Join(base, "plugin")
+	palette := filepath.Join(home, ".local", "state", "omarchy")
+	for _, d := range []string{palette, filepath.Join(cfg, "themes"), workspace, pluginDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	os.WriteFile(filepath.Join(palette, "colors.toml"), []byte(`background = "#000000"`), 0o644)
+	os.WriteFile(filepath.Join(workspace, "main.go"), []byte("package main"), 0o644)
+	t.Setenv("HOME", home)
+	config.OverrideConfigDir = cfg
+	t.Cleanup(func() { config.OverrideConfigDir = "" })
+
+	p := &plugin.Plugin{Dir: pluginDir, Granted: plugin.PermissionSet{
+		FsRead:  plugin.FsAccess{Paths: []string{"~/.local/state/omarchy"}},
+		FsWrite: plugin.FsAccess{Paths: []string{"{config}/themes"}},
+	}}
+	fs := NewPluginFilesystemAPIFor(p, []string{workspace})
+
+	if got, err := fs.ReadFile("~/.local/state/omarchy/colors.toml"); err != nil || got != `background = "#000000"` {
+		t.Errorf("read the granted path = %q, %v", got, err)
+	}
+	if _, err := fs.ReadFile(filepath.Join(workspace, "main.go")); err == nil {
+		t.Error("the workspace was readable without {workspace} in fs.read")
+	}
+	if err := fs.WriteFile("{config}/themes/omarchy.json", "{}"); err != nil {
+		t.Errorf("write the granted path: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(cfg, "themes", "omarchy.json")); err != nil {
+		t.Errorf("{config} did not expand to the config dir: %v", err)
+	}
+	if err := fs.WriteFile(filepath.Join(palette, "colors.toml"), "x"); err == nil {
+		t.Error("a read-only path was writable")
+	}
+	if _, err := fs.ReadFile(filepath.Join(cfg, "themes", "omarchy.json")); err == nil {
+		t.Error("a write-only path was readable")
+	}
+	if err := fs.WriteFile(filepath.Join(pluginDir, "cache.json"), "{}"); err != nil {
+		t.Errorf("the plugin dir must stay writable: %v", err)
+	}
+}
+
+func TestPluginFilesystemAPIFor_AnyPathAndWorkspace(t *testing.T) {
+	base := t.TempDir()
+	workspace := filepath.Join(base, "ws")
+	outside := filepath.Join(base, "outside")
+	for _, d := range []string{workspace, outside} {
+		os.MkdirAll(d, 0o755)
+		os.WriteFile(filepath.Join(d, "f.txt"), []byte("x"), 0o644)
+	}
+
+	p := &plugin.Plugin{Granted: plugin.PermissionSet{
+		FsRead:  plugin.FsAccess{Paths: []string{plugin.FsAnyPath}},
+		FsWrite: plugin.FsAccess{Paths: []string{plugin.FsWorkspace}},
+	}}
+	fs := NewPluginFilesystemAPIFor(p, []string{workspace})
+
+	if _, err := fs.ReadFile(filepath.Join(outside, "f.txt")); err != nil {
+		t.Errorf("* must allow reading any path: %v", err)
+	}
+	if err := fs.WriteFile(filepath.Join(workspace, "f.txt"), "y"); err != nil {
+		t.Errorf("{workspace} must allow writing the workspace: %v", err)
+	}
+	if err := fs.WriteFile(filepath.Join(outside, "f.txt"), "y"); err == nil {
+		t.Error("writing outside the workspace was allowed")
 	}
 }
